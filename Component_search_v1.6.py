@@ -231,10 +231,12 @@ class ComponentFilterApp(QMainWindow):
         normalized = re.sub(r'\s*,\s*', ',', normalized)
         normalized = re.sub(r'(\d),(\d)', r'\1.\2', normalized)
         normalized = re.sub(r'(\d+)\s*%', r'\1%', normalized)
-        normalized = re.sub(r'\s*(nf|uf|pf|мкф|нф|пф|om|kOm|mom|ом|k Om|мОм|ohm|kohm|mohm|v|в|volt|вольт)\s*', r' \1',
-                            normalized)
-        normalized = re.sub(r'(\d)\s*(nf|uf|pf|мкф|нф|пф|om|kOm|mom|ом|k Om|мОм|ohm|kohm|mohm|v|в|volt|вольт)',
-                            r'\1 \2', normalized)
+        # Токены единиц отсортированы от длинных к коротким, иначе «kom»
+        # разбивается на «k om», а «mom»/«ohm» — неправильно.
+        units = (r'kohm|mohm|kom|mom|ohm|om|volt|вольт|мкф|нф|пф|ком|мом|ом|'
+                 r'nf|uf|pf|v|в')
+        normalized = re.sub(r'\s*(' + units + r')\s*', r' \1', normalized)
+        normalized = re.sub(r'(\d)\s*(' + units + r')', r'\1 \2', normalized)
         normalized = re.sub(r'\s{2,}', ' ', normalized)
 
         # Убираем все в скобках для конденсаторов
@@ -251,6 +253,169 @@ class ComponentFilterApp(QMainWindow):
         for key, value in row.items():
             normalized_row[key] = self.normalize_value(value)
         return normalized_row
+
+    # ---------- Номиналы: разбор, объединение и сортировка ----------
+    ALL_KEY = '__ALL__'
+
+    # Таблицы единиц: (множитель к базовой единице, отображаемый суффикс).
+    # Порядок в кортеже задаёт возрастание номинала.
+    _UNIT_TABLES = {
+        'R': ((1e-6, 'uΩ'), (1e-3, 'mΩ'), (1.0, 'Ω'), (1e3, 'kΩ'),
+              (1e6, 'MΩ'), (1e9, 'GΩ')),
+        'C': ((1e-12, 'pF'), (1e-9, 'nF'), (1e-6, 'uF'), (1e-3, 'mF'), (1.0, 'F')),
+        'V': ((1e-9, 'nV'), (1e-6, 'uV'), (1e-3, 'mV'), (1.0, 'V'), (1e3, 'kV')),
+    }
+    _UNIT_WEIGHT = {
+        'uΩ': 0, 'mΩ': 1, 'Ω': 2, 'kΩ': 3, 'MΩ': 4, 'GΩ': 5,
+        'pF': 0, 'nF': 1, 'uF': 2, 'mF': 3, 'F': 4,
+        'nV': 0, 'uV': 1, 'mV': 2, 'V': 3, 'kV': 4,
+        '%': 0,
+    }
+    _UNIT_MULT = {suffix: mult
+                  for table in _UNIT_TABLES.values()
+                  for mult, suffix in table}
+    _UNIT_MULT['%'] = 1.0
+    _QUANT_FACTOR = {'R': 10 ** 9, 'C': 10 ** 15, 'V': 10 ** 9, 'P': 10 ** 6}
+    _KIND_ORDER = {'R': 0, 'C': 1, 'V': 2, 'P': 3}
+    _VALUE_RE = re.compile(
+        r'^(?:([A-Za-zА-Яа-яµμ]+\s+))?'           # необязательная приставка (например, ESR)
+        r'([+-]?\d+(?:[.,]\d+)?)\s*'               # число
+        r'([A-Za-zА-Яа-яµμ%Ωω]+'                   # единица измерения
+        r'(?:\s+[A-Za-zА-Яа-яµμ%Ωω]+)*)\s*$'       # допускаем «k om» как «kOm»
+    )
+
+    @staticmethod
+    def _fmt_num(value):
+        """Компактная запись числа без лишних нулей."""
+        if abs(value - round(value)) < 1e-9:
+            return str(int(round(value)))
+        return ('%.6f' % value).rstrip('0').rstrip('.')
+
+    def parse_electrical(self, value):
+        """Разбирает номинал вида '2.2 nF', '1 kOm', '5 mV'.
+
+        Возвращает (kind, base, suffix, prefix) или None, где kind — 'R'
+        (сопротивление), 'C' (ёмкость), 'V' (напряжение) или 'P' (проценты),
+        base — величина в базовых единицах (Ом/Фарад/Вольт)."""
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        match = self._VALUE_RE.match(text)
+        if not match:
+            return None
+        prefix = (match.group(1) or '').strip()
+        try:
+            number = float(match.group(2).replace(',', '.'))
+        except ValueError:
+            return None
+        unit = match.group(3)
+        low = unit.lower().replace('.', '').replace(' ', '')
+        first = unit[0]
+
+        # Сопротивление (данные используют 'Om', встречается 'Ohm', 'R', 'мОм').
+        if low in ('om', 'ohm', 'ohms', 'r', 'ом', 'Ω', 'ω'):
+            return ('R', number, 'Ω', prefix)
+        if low in ('uom', 'µom', 'μom', 'мком'):
+            return ('R', number * 1e-6, 'uΩ', prefix)
+        if low in ('mom', 'mohm', 'мом'):
+            # Регистр первой буквы различает милли- и мега-.
+            if first in ('M', 'М'):
+                return ('R', number * 1e6, 'MΩ', prefix)
+            return ('R', number * 1e-3, 'mΩ', prefix)
+        if low in ('kom', 'kohm', 'ком'):
+            return ('R', number * 1e3, 'kΩ', prefix)
+        if low in ('gom', 'gohm', 'гом'):
+            return ('R', number * 1e9, 'GΩ', prefix)
+        # Ёмкость
+        if low in ('pf', 'пф'):
+            return ('C', number * 1e-12, 'pF', prefix)
+        if low in ('nf', 'нф'):
+            return ('C', number * 1e-9, 'nF', prefix)
+        if low in ('uf', 'µf', 'μf', 'мкф'):
+            return ('C', number * 1e-6, 'uF', prefix)
+        if low in ('mf', 'мф'):
+            return ('C', number * 1e-3, 'mF', prefix)
+        if low in ('f', 'ф'):
+            return ('C', number, 'F', prefix)
+        # Напряжение
+        if low in ('v', 'в', 'volt', 'вольт'):
+            return ('V', number, 'V', prefix)
+        if low in ('nv', 'нв'):
+            return ('V', number * 1e-9, 'nV', prefix)
+        if low in ('uv', 'µv', 'μv', 'мкв'):
+            return ('V', number * 1e-6, 'uV', prefix)
+        if low in ('mv', 'мв'):
+            return ('V', number * 1e-3, 'mV', prefix)
+        if low in ('kv', 'кв'):
+            return ('V', number * 1e3, 'kV', prefix)
+        # Проценты (допуски)
+        if low == '%':
+            return ('P', number, '%', prefix)
+        return None
+
+    def _quantize(self, kind, base):
+        """Целое представление базовой величины — для точного сравнения."""
+        factor = self._QUANT_FACTOR.get(kind, 1)
+        return int(round(base * factor))
+
+    def _canonical_key(self, value):
+        """Стабильный строковый ключ номинала для хранения в выпадающем списке."""
+        parsed = self.parse_electrical(value)
+        if parsed is None:
+            return 'S:' + str(value).strip()
+        kind, base, _suffix, prefix = parsed
+        return '%s:%d:%s' % (kind, self._quantize(kind, base), prefix)
+
+    def _format_electrical(self, kind, base, suffix, prefix=''):
+        """Строка номинала с выбранной единицей (для сопротивлений — символ Ω)."""
+        value = base / self._UNIT_MULT.get(suffix, 1.0)
+        text = '%s %s' % (self._fmt_num(value), suffix)
+        return ('%s %s' % (prefix, text)) if prefix else text
+
+    def _build_combo_entries(self, raw_values):
+        """Объединяет эквивалентные номиналы (100 nF = 0.1 uF → 0.1 uF,
+        2200 pF = 2.2 nF → 2.2 nF) и сортирует их по возрастанию."""
+        groups = {}
+        for raw in raw_values:
+            text = str(raw).strip()
+            if not text:
+                continue
+            parsed = self.parse_electrical(text)
+            key = self._canonical_key(text)
+            if parsed is None:
+                groups.setdefault(key, {
+                    'display': text,
+                    'sort': (9, text.lower(), 0),
+                    'key': key,
+                    'weight': -1,
+                })
+                continue
+
+            kind, base, suffix, prefix = parsed
+            sort_key = (self._KIND_ORDER.get(kind, 4), prefix.lower(),
+                        self._quantize(kind, base))
+            weight = self._UNIT_WEIGHT.get(suffix, 0)
+            display = self._format_electrical(kind, base, suffix, prefix)
+            existing = groups.get(key)
+            # При равных номиналах оставляем запись с более крупной единицей.
+            if existing is None or weight > existing['weight']:
+                groups[key] = {
+                    'display': display,
+                    'sort': sort_key,
+                    'key': key,
+                    'weight': weight,
+                }
+
+        entries = sorted(groups.values(), key=lambda item: item['sort'])
+        return [(entry['display'], entry['key']) for entry in entries]
+
+    @staticmethod
+    def _restore_combo_key(combo, key):
+        """Возвращает ранее выбранный элемент (по ключу), иначе «Все»."""
+        index = combo.findData(key) if key is not None else -1
+        combo.setCurrentIndex(index if index >= 0 else 0)
 
     def init_ui(self):
         self.setWindowTitle('Фильтр компонентов - Чистая зона')
@@ -1505,6 +1670,18 @@ class ComponentFilterApp(QMainWindow):
         # Пользовательские вкладки: точное совпадение с одной из категорий.
         return category in matcher
 
+    def _special_filter_source(self, matcher):
+        """Сырые (ненормализованные) строки выбранной категории.
+
+        Категорию определяем по нормализованной строке, а номиналы берём из
+        исходных данных, чтобы не терять регистр единиц (kOm/MOm) и не получать
+        «k om» после нормализации."""
+        if not getattr(self, 'filtered_normalized', None):
+            return []
+        return [self.filtered_data[i]
+                for i, row in enumerate(self.filtered_normalized)
+                if self._matches_category(row, matcher)]
+
     def _next_custom_key(self):
         index = 1
         while f'custom_{index}' in self.special_filter_sets:
@@ -1680,41 +1857,47 @@ class ComponentFilterApp(QMainWindow):
         if key not in self.special_filter_sets or not hasattr(self, 'filtered_normalized'):
             return
         filters = self.special_filter_sets[key]
-        source = [row for row in self.filtered_normalized
-                  if self._matches_category(row, matcher)]
+        source = self._special_filter_source(matcher)
         for filter_id, column, combo in filters:
-            current = combo.currentText()
-            values = set()
+            current_key = combo.currentData()
+            values = []
             for row in source:
-                if all(other_id == filter_id or other_combo.currentText() == "Все"
-                       or self._filter_row_value(row, other_column) == other_combo.currentText()
+                if all(other_id == filter_id
+                       or other_combo.currentData() in (None, self.ALL_KEY)
+                       or self._canonical_key(self._filter_row_value(row, other_column)) == other_combo.currentData()
                        for other_id, other_column, other_combo in filters):
                     value = self._filter_row_value(row, column)
                     if value:
-                        values.add(value)
+                        values.append(value)
             combo.blockSignals(True)
             combo.clear()
-            combo.addItem("Все")
+            combo.addItem("Все", self.ALL_KEY)
             if column == self.STOCK_COLUMN:
                 # Фиксированный логичный порядок статусов наличия.
+                present = set(values)
                 order = [self.STOCK_IN, self.STOCK_LOW, self.STOCK_NONE]
-                combo.addItems([s for s in order if s in values])
+                for status in order:
+                    if status in present:
+                        combo.addItem(status, self._canonical_key(status))
             else:
-                combo.addItems(sorted(values, key=str.lower))
-            combo.setCurrentText(current if current in values else "Все")
+                for display, value_key in self._build_combo_entries(values):
+                    combo.addItem(display, value_key)
+            self._restore_combo_key(combo, current_key)
             combo.blockSignals(False)
 
     def apply_special_smart_filters(self, key, matcher, table):
         self.update_special_smart_filters(key, matcher)
         filters = self.special_filter_sets[key]
         result = []
-        for index, row in enumerate(self.filtered_normalized):
-            if not self._matches_category(row, matcher):
+        for index, normalized_row in enumerate(self.filtered_normalized):
+            if not self._matches_category(normalized_row, matcher):
                 continue
-            if all(combo.currentText() == "Все"
-                   or self._filter_row_value(row, column) == combo.currentText()
+            # Номиналы сравниваем по сырым данным (без потери регистра единиц).
+            row = self.filtered_data[index]
+            if all(combo.currentData() in (None, self.ALL_KEY)
+                   or self._canonical_key(self._filter_row_value(row, column)) == combo.currentData()
                    for _, column, combo in filters):
-                result.append(self.filtered_data[index])
+                result.append(row)
         self.display_data_in_table(table, result)
 
     def _matches_main_filters(self, row, exclude_column=None, include_text=True, exclude_stock=False):
@@ -1726,9 +1909,11 @@ class ComponentFilterApp(QMainWindow):
         for column, combo in self.main_smart_filters.items():
             if column == exclude_column:
                 continue
-            selected = combo.currentText()
-            if selected != "Все" and str(row.get(column, '')).strip() != selected:
-                return False
+            selected_key = combo.currentData()
+            if selected_key not in (None, self.ALL_KEY):
+                row_key = self._canonical_key(str(row.get(column, '')).strip())
+                if row_key != selected_key:
+                    return False
 
         if include_text:
             search_text = self.search_input.text()
@@ -1762,24 +1947,24 @@ class ComponentFilterApp(QMainWindow):
             return
         source = self._main_filter_source()
         for column, combo in self.main_smart_filters.items():
-            current = combo.currentText()
-            values = {
-                str(row.get(column, '')).strip()
-                for row in source
-                if str(row.get(column, '')).strip()
-                   and self._matches_main_filters(row, exclude_column=column)
-            }
+            current_key = combo.currentData()
+            values = []
+            for row in source:
+                value = str(row.get(column, '')).strip()
+                if value and self._matches_main_filters(row, exclude_column=column):
+                    values.append(value)
             combo.blockSignals(True)
             combo.clear()
-            combo.addItem("Все")
-            combo.addItems(sorted(values, key=lambda value: value.lower()))
-            combo.setCurrentText(current if current in values else "Все")
+            combo.addItem("Все", self.ALL_KEY)
+            for display, value_key in self._build_combo_entries(values):
+                combo.addItem(display, value_key)
+            self._restore_combo_key(combo, current_key)
             combo.blockSignals(False)
 
         # Умный фильтр наличия: показываем только статусы, доступные при остальных фильтрах.
         if hasattr(self, 'stock_filter_combo'):
             stock_combo = self.stock_filter_combo
-            current = stock_combo.currentText()
+            current_key = stock_combo.currentData()
             statuses = {
                 self.stock_status(row)
                 for row in source
@@ -1789,9 +1974,10 @@ class ComponentFilterApp(QMainWindow):
             available = [s for s in order if s in statuses]
             stock_combo.blockSignals(True)
             stock_combo.clear()
-            stock_combo.addItem("Все")
-            stock_combo.addItems(available)
-            stock_combo.setCurrentText(current if not current or current in available else "Все")
+            stock_combo.addItem("Все", self.ALL_KEY)
+            for status in available:
+                stock_combo.addItem(status, self._canonical_key(status))
+            self._restore_combo_key(stock_combo, current_key)
             stock_combo.blockSignals(False)
 
     def apply_main_filters(self, rebuild_options=True):

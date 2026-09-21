@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# Qt / IDE
+*.ui.py
+.idea/
+.vscode/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Снимки данных 1С (раскомментируйте, если CSV не должен попадать в репозиторий)
+# *_component_list.csv
