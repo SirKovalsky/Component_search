@@ -477,6 +477,31 @@ class FetchWorker(QThread):
         return files
 
 
+# Фоновые воркеры, которые продолжают работу после закрытия диалога.
+# Держим ссылки, чтобы Qt не уничтожил поток во время выполнения
+# (иначе падение "QThread: Destroyed while thread is still running").
+_ACTIVE_WORKERS = set()
+
+
+def _on_worker_finished(worker):
+    _ACTIVE_WORKERS.discard(worker)
+    worker.deleteLater()
+
+
+def _wait_for_active_workers(timeout_ms=15000):
+    """Дожидается фоновых воркеров при выходе из приложения."""
+    for worker in list(_ACTIVE_WORKERS):
+        if worker.isRunning():
+            worker.wait(timeout_ms)
+
+
+def _install_quit_hook(app):
+    if app is None or getattr(app, '_sync_quit_hook', False):
+        return
+    app.aboutToQuit.connect(_wait_for_active_workers)
+    app._sync_quit_hook = True
+
+
 # --------------------------------------------------------------------------
 # Диалог
 # --------------------------------------------------------------------------
@@ -617,6 +642,36 @@ class SyncDBDialog(QDialog):
                 pass
         QDesktopServices.openUrl(QUrl.fromLocalFile(DATA_DIR))
 
+    # ---- безопасное закрытие во время загрузки ----
+    def _detach_worker(self):
+        """Отвязывает работающий поток от окна, чтобы закрытие не падало.
+
+        Поток продолжает доживать в фоне (до connect_timeout), а окно можно
+        спокойно закрыть."""
+        worker = self.worker
+        if worker is None:
+            return
+        if not worker.isRunning():
+            return
+        for signal in (worker.progress, worker.status,
+                       worker.finished_ok, worker.failed):
+            try:
+                signal.disconnect()
+            except TypeError:
+                pass
+        worker.setParent(None)
+        self.worker = None
+        _ACTIVE_WORKERS.add(worker)
+        worker.finished.connect(lambda w=worker: _on_worker_finished(w))
+
+    def done(self, result):
+        self._detach_worker()
+        super().done(result)
+
+    def closeEvent(self, event):
+        self._detach_worker()
+        super().closeEvent(event)
+
     # ---- запуск загрузки ----
     def start_fetch(self):
         missing = self._missing_drivers()
@@ -674,6 +729,7 @@ def open_sync_dialog(parent=None):
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
+    _install_quit_hook(app)
     dialog = SyncDBDialog(parent)
     return dialog.exec_()
 
@@ -681,6 +737,7 @@ def open_sync_dialog(parent=None):
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    _install_quit_hook(app)
     dialog = SyncDBDialog()
     dialog.show()
     sys.exit(app.exec_())
