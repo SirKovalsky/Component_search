@@ -418,7 +418,7 @@ class ComponentFilterApp(QMainWindow):
         combo.setCurrentIndex(index if index >= 0 else 0)
 
     def init_ui(self):
-        self.setWindowTitle('Фильтр компонентов - Чистая зона')
+        self.setWindowTitle('Фильтр компонентов - Чистая зона (v2.0)')
         self.setGeometry(80, 60, 1800, 1000)
         self.setStyleSheet("""
             QMainWindow { background: #f4f7fb; }
@@ -518,10 +518,10 @@ class ComponentFilterApp(QMainWindow):
             }
         """)
 
-        self.filter_btn = QPushButton("Фильтровать и сохранить")
-        self.filter_btn.clicked.connect(self.filter_and_save)
-        self.filter_btn.setEnabled(False)
-        self.filter_btn.setStyleSheet("""
+        # Кнопка выгрузки данных из базы (sync_db.py)
+        self.sync_btn = QPushButton("Выгрузить с DB")
+        self.sync_btn.clicked.connect(self.sync_from_db)
+        self.sync_btn.setStyleSheet("""
             QPushButton {
                 background-color: #2196F3;
                 color: white;
@@ -592,7 +592,7 @@ class ComponentFilterApp(QMainWindow):
         file_layout.addWidget(self.input_label)
         file_layout.addWidget(input_btn)
         file_layout.addWidget(self.recent_btn)
-        file_layout.addWidget(self.filter_btn)
+        file_layout.addWidget(self.sync_btn)
         file_layout.addWidget(self.columns_btn)
         file_layout.addWidget(self.add_tab_btn)
         file_layout.addWidget(self.auto_open_checkbox)
@@ -1292,14 +1292,7 @@ class ComponentFilterApp(QMainWindow):
             QMessageBox.warning(self, "Файл не найден", f"Файл больше не существует:\n{file_path}")
             return
 
-        self.input_file = file_path
-        self.add_recent_file(file_path)
-        self.settings.setValue("last_file", file_path)
-        self.input_label.setText(f"Входной файл: {os.path.basename(file_path)}")
-        self.filter_btn.setEnabled(True)
-        self.columns_btn.setEnabled(True)
-        self.load_csv_data(file_path)
-        self.load_initial_tab_data()
+        self.load_data_file(file_path)
         self.log_status(f"Открыт файл из истории: {file_path}")
 
     def clear_recent_files(self):
@@ -1559,23 +1552,53 @@ class ComponentFilterApp(QMainWindow):
 
         dialog.exec_()
 
+    def load_data_file(self, file_path):
+        """Загружает CSV-файл в приложение и наполняет вкладки."""
+        self.input_file = file_path
+        self.input_label.setText(f"Входной файл: {os.path.basename(file_path)}")
+        self.add_recent_file(file_path)
+        self.settings.setValue("last_file", file_path)
+        self.columns_btn.setEnabled(True)
+        self.add_tab_btn.setEnabled(True)
+        self.load_csv_data(file_path)
+        self.load_initial_tab_data()
+
     def select_input_file(self):
         file_name, _ = QFileDialog.getOpenFileName(
             self, "Выберите CSV файл", "", "CSV Files (*.csv)"
         )
-
         if file_name:
-            self.input_file = file_name
-            self.input_label.setText(f"Входной файл: {os.path.basename(file_name)}")
-            self.add_recent_file(file_name)
-            self.settings.setValue("last_file", file_name)
-            self.filter_btn.setEnabled(True)
-            self.columns_btn.setEnabled(True)
-            self.load_csv_data(file_name)
+            self.load_data_file(file_name)
             self.log_status(f"Загружен файл: {file_name}")
 
-            # После загрузки файла сразу загружаем данные для вкладок
-            self.load_initial_tab_data()
+    def sync_from_db(self):
+        """Запускает sync_db.py, затем загружает выгруженный CSV."""
+        try:
+            import sync_db
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Выгрузка с DB",
+                f"Не удалось загрузить sync_db.py:\n{exc}")
+            return
+
+        csv_path = os.path.join(sync_db.DATA_DIR, sync_db.NOMENCLATURE_FILE)
+        before = os.path.getmtime(csv_path) if os.path.exists(csv_path) else None
+        self.log_status("Выгрузка с DB: открыто окно синхронизации")
+
+        sync_db.open_sync_dialog(self)
+
+        if not os.path.exists(csv_path):
+            self.log_status("Выгрузка с DB: файл выгрузки не найден")
+            return
+        after = os.path.getmtime(csv_path)
+        if before is not None and after == before:
+            self.log_status("Выгрузка с DB: файл не обновлялся")
+            return
+
+        self.load_data_file(csv_path)
+        self.log_status(
+            f"Выгрузка с DB: загружено {len(self.all_data)} записей "
+            f"из {os.path.basename(csv_path)}")
 
     def load_csv_data(self, file_path):
         try:
@@ -1819,6 +1842,18 @@ class ComponentFilterApp(QMainWindow):
         self._set_table_query(table, text)
         self.perform_global_search(text, table)
 
+    def _confirm_close_tab(self, title):
+        """Диалог подтверждения закрытия вкладки (Да/Нет)."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Закрытие вкладки")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"Закрыть вкладку «{title}»?")
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        box.button(QMessageBox.Yes).setText("Да")
+        box.button(QMessageBox.No).setText("Нет")
+        return box.exec_() == QMessageBox.Yes
+
     def on_tab_close_requested(self, index):
         """Закрывает пользовательскую вкладку; встроенные не закрываются."""
         widget = self.tab_widget.widget(index)
@@ -1826,6 +1861,8 @@ class ComponentFilterApp(QMainWindow):
         if key is None:
             return
         title = self.tab_widget.tabText(index)
+        if not self._confirm_close_tab(title):
+            return
         self.tab_widget.removeTab(index)
         self.custom_tabs.pop(key, None)
         self.special_filter_sets.pop(key, None)
@@ -2047,54 +2084,6 @@ class ComponentFilterApp(QMainWindow):
             if self.search_terms_match(row_data, text)
         ]
         self.display_data_in_table(table, filtered_data)
-
-    def filter_and_save(self):
-        if not self.input_file:
-            return
-
-        output_file, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить отфильтрованный файл",
-            f"{datetime.now().strftime('%Y-%m-%d')}_component_list.csv",
-            "CSV Files (*.csv)"
-        )
-
-        if not output_file:
-            return
-
-        try:
-            filtered_data = []
-            filtered_indices = []
-
-            for idx, row in enumerate(self.all_data):
-                store_full_name = row.get('StoreFullName', '')
-                if store_full_name and 'Чистая зона' in store_full_name:
-                    filtered_data.append(row)
-                    filtered_indices.append(idx)
-
-            if not filtered_data:
-                QMessageBox.warning(self, "Предупреждение",
-                                    "Не найдено записей с 'Чистая зона' в месте хранения")
-                return
-
-            with open(output_file, 'w', newline='', encoding='utf-8') as file:
-                writer = csv.DictWriter(file, fieldnames=self.headers, delimiter=';')
-                writer.writeheader()
-                writer.writerows(filtered_data)
-
-            self.filtered_data = filtered_data
-            self.filtered_normalized = [self.normalized_data[i] for i in filtered_indices]
-
-            self.display_data_in_table(self.search_table, filtered_data)
-            self.update_special_tabs()
-            self.update_main_smart_filters()
-            self.apply_main_filters()
-
-            self.log_status(f"Сохранено {len(filtered_data)} записей в: {output_file}")
-            QMessageBox.information(self, "Успех",
-                                    f"Сохранено {len(filtered_data)} записей в:\n{output_file}")
-
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить файл:\n{str(e)}")
 
     def update_special_tabs(self):
         if not hasattr(self, 'filtered_normalized'):
